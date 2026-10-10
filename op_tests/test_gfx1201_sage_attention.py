@@ -12,6 +12,10 @@ from aiter.test_mha_common import attention_ref
 # Same tolerance band as the Triton SageAttention test (op_tests/triton_tests/attention/test_fav3_sage.py).
 ATOL, RTOL, MAX_FAIL_PERCENT = 0.3, 0.25, 0.5
 MIN_COSINE, MIN_ROW_COSINE_MEDIAN = 0.998, 0.99
+BACKENDS = ("asm", "hip")
+# The code object rounds Q K^T differently from the HIP kernel on fast-path tiles (see
+# gfx1201_sage_attention_fwd); measured asm-vs-hip relative L2 is ~2e-3 on randn inputs.
+MAX_ASM_VS_HIP_REL_L2 = 5e-3
 
 
 def accuracy(out, ref):
@@ -83,7 +87,7 @@ def inputs(batch, rows, heads, scale=1.0, seed=0):
     )
 
 
-def test_accuracy():
+def test_accuracy(backend):
     ok = True
     op = torch.ops.aiter.gfx1201_sage_attention
     for batch, rows, heads, scale in (
@@ -95,29 +99,32 @@ def test_accuracy():
         (1, 16384, 2, 1.0),
     ):
         q, k, v = inputs(batch, rows, heads, scale)
-        out = op(q, k, v)
+        out = op(q, k, v, backend=backend)
         ref = attention_ref(q, k, v)[0]
         ok &= out.shape == q.shape and out.is_contiguous()
-        ok &= check_accuracy(f"B{batch} S{rows} H{heads} x{scale}", out, ref)
+        ok &= check_accuracy(f"{backend} B{batch} S{rows} H{heads} x{scale}", out, ref)
     q, k, v = inputs(1, 777, 4)
     scale = 0.05
     ref = attention_ref(q * (scale * 128**0.5), k, v)[0]
-    ok &= check_accuracy("softmax_scale=0.05", op(q, k, v, scale), ref)
+    ok &= check_accuracy(
+        f"{backend} softmax_scale=0.05", op(q, k, v, scale, backend=backend), ref
+    )
     return ok
 
 
-def test_tails():
+def test_tails(backend):
     ok = True
+    op = torch.ops.aiter.gfx1201_sage_attention
     for rows in (1, 4, 15, 16, 17, 31, 32, 33, 63, 64, 65, 97, 511, 512, 513, 1025):
         q, k, v = inputs(2, rows, 3, seed=rows)
-        out = torch.ops.aiter.gfx1201_sage_attention(q, k, v)
-        ok &= check_accuracy(f"tail S{rows}", out, attention_ref(q, k, v)[0])
+        out = op(q, k, v, backend=backend)
+        ok &= check_accuracy(f"{backend} tail S{rows}", out, attention_ref(q, k, v)[0])
         q.zero_()
         k.zero_()
         v.fill_(1)
-        flat = torch.ops.aiter.gfx1201_sage_attention(q, k, v)
+        flat = op(q, k, v, backend=backend)
         ok &= report(
-            f"uniform S{rows}",
+            f"{backend} uniform S{rows}",
             {"max_abs": (flat.float() - 1).abs().max().item()},
             (flat.float() - 1).abs().max() <= 8e-3,
         )
@@ -146,6 +153,28 @@ def test_fused_norm_rope():
         ok &= check_accuracy(
             f"fused vs ref S{rows}", fused, attention_ref(q2, k2, v)[0]
         )
+    return ok
+
+
+def test_asm_vs_hip():
+    ok = True
+    op = torch.ops.aiter.gfx1201_sage_attention
+    # x1: every tile on the fast path; x8: q_scale * k_scale > 1/384 everywhere -> exact path.
+    for scale in (1.0, 8.0):
+        q, k, v = inputs(2, 1000, 5, seed=7)
+        q, k = q * scale, k * scale
+        asm = op(q, k, v, backend="asm")
+        hip = op(q, k, v, backend="hip")
+        rel = ((asm.float() - hip.float()).norm() / hip.float().norm()).item()
+        if scale == 1.0:
+            ok &= report(
+                "asm vs hip, fast path", {"rel_l2": rel}, rel <= MAX_ASM_VS_HIP_REL_L2
+            )
+        else:
+            same = torch.equal(asm, hip)
+            ok &= report("asm == hip, exact path", {"bitwise": float(same)}, same)
+        same = torch.equal(asm, op(q, k, v, backend="asm"))
+        ok &= report(f"asm repeatable x{scale}", {"bitwise": float(same)}, same)
     return ok
 
 
@@ -191,6 +220,11 @@ def test_invalid_inputs():
             ok &= report(f"rejects {name}", {}, False)
         except (ValueError, RuntimeError):
             ok &= report(f"rejects {name}", {}, True)
+    try:
+        torch.ops.aiter.gfx1201_sage_attention(q, k, v, backend="ck")
+        ok &= report("rejects backend ck", {}, False)
+    except (ValueError, RuntimeError):
+        ok &= report("rejects backend ck", {}, True)
     return ok
 
 
@@ -201,9 +235,11 @@ def main():
     import aiter  # noqa: F401  registers torch.ops.aiter.gfx1201_sage_attention
 
     ok = True
+    for backend in BACKENDS:
+        ok &= test_accuracy(backend)
+        ok &= test_tails(backend)
     for test in (
-        test_accuracy,
-        test_tails,
+        test_asm_vs_hip,
         test_fused_norm_rope,
         test_registration_and_streams,
         test_invalid_inputs,
