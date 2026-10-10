@@ -2098,7 +2098,8 @@
     "module_gfx1201_sage_attention": {
         "srcs": [
             "f'{AITER_CSRC_DIR}/pybind/gfx1201_sage_attention_pybind.cu'",
-            "f'{AITER_CSRC_DIR}/kernels/gfx1201_sage_attention.cu'"
+            "f'{AITER_CSRC_DIR}/kernels/gfx1201_sage_attention.cu'",
+            "f'{AITER_CSRC_DIR}/kernels/gfx1201_sol_route.cu'"
         ],
         "flags_extra_cc": [],
         "flags_extra_hip": [],

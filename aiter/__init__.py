@@ -162,6 +162,7 @@ else:
     from .ops.fused_qk_norm_rope_cache_quant import *
     from .ops.gfx1201_sage_prepare import *
     from .ops.gfx1201_sage_attention import *
+    from .ops.gfx1201_sol_attention import *
     from .ops.fused_qk_rmsnorm_group_quant import *
     from .ops.inverse_rope_group_quant import *
     from .ops.groupnorm import *

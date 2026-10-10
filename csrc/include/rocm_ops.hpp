@@ -2928,4 +2928,45 @@ namespace py = pybind11;
           py::arg("v_fp8"),                                         \
           py::arg("v_scale"),                                       \
           py::arg("out"),                                           \
+          py::arg("seq_len"),                                       \
+          py::arg("tile_list")  = py::none(),                       \
+          py::arg("tile_count") = py::none(),                       \
+          py::arg("state")      = py::none());
+
+#define GFX1201_SOL_ATTENTION_PYBIND                                \
+    m.def("gfx1201_sol_route_hip",                                  \
+          &gfx1201_sol_route_hip,                                   \
+          py::arg("q_int8"),                                        \
+          py::arg("q_scale"),                                       \
+          py::arg("k_int8"),                                        \
+          py::arg("k_scale"),                                       \
+          py::arg("v_fp8"),                                         \
+          py::arg("v_scale"),                                       \
+          py::arg("kbar"),                                          \
+          py::arg("vsum"),                                          \
+          py::arg("kb"),                                            \
+          py::arg("kb_scale"),                                      \
+          py::arg("vb"),                                            \
+          py::arg("vb_scale"),                                      \
+          py::arg("mu"),                                            \
+          py::arg("var"),                                           \
+          py::arg("tile_list"),                                     \
+          py::arg("tile_count"),                                    \
+          py::arg("mask"),                                          \
+          py::arg("seq_len"),                                       \
+          py::arg("sink_start"),                                    \
+          py::arg("sink_tokens"),                                   \
+          py::arg("tau"));                                          \
+    m.def("gfx1201_sol_phase_a_hip",                                \
+          &gfx1201_sol_phase_a_hip,                                 \
+          py::arg("q_int8"),                                        \
+          py::arg("q_scale"),                                       \
+          py::arg("v_scale"),                                       \
+          py::arg("kb"),                                            \
+          py::arg("vb"),                                            \
+          py::arg("kb_scale"),                                      \
+          py::arg("vb_scale"),                                      \
+          py::arg("block_len"),                                     \
+          py::arg("mask"),                                          \
+          py::arg("state"),                                         \
           py::arg("seq_len"));
