@@ -7,9 +7,10 @@ Providers run in interleaved rounds on the same inputs; the reported time is the
 median over rounds of the per-round mean. With --compare_to_ref every provider is
 also checked against an FP32 reference (computed in query chunks). ``sage``/``sage_core``
 use the code object (default backend), ``sage_hip``/``sage_core_hip`` the HIP kernel;
-``*_core`` times the attention kernel alone on prepared inputs. ``sol_hip``/``sol_core_hip``
-run the Sol sparse attention (routing included) at ``--tau``/``--sink_tokens``/``--sink_start``; random inputs have
-no attention structure, so their routing density (and speed) does not represent a real model.
+``*_core`` times the attention kernel alone on prepared inputs. ``sol``/``sol_core`` (code object)
+and ``sol_hip``/``sol_core_hip`` run the Sol sparse attention (routing included) at
+``--tau``/``--sink_tokens``/``--sink_start``; random inputs have no attention structure, so their
+routing density (and speed) does not represent a real model.
 """
 
 import argparse
@@ -61,23 +62,26 @@ def make_providers(names, tau=1.0, sink_tokens=0, sink_start=None):
                 )[:, : q.shape[1]]
 
             providers[f"sage_core{suffix}"] = core
-    if "sol_hip" in names:
-        providers["sol_hip"] = lambda q, k, v: torch.ops.aiter.gfx1201_sol_attention(
-            q, k, v, tau, sink_tokens, sink_start
-        )
-    if "sol_core_hip" in names:
-        sol_cache = {}
+    for backend, suffix in (("asm", ""), ("hip", "_hip")):
+        if f"sol{suffix}" in names:
+            providers[f"sol{suffix}"] = (
+                lambda q, k, v, b=backend: torch.ops.aiter.gfx1201_sol_attention(
+                    q, k, v, tau, sink_tokens, sink_start, backend=b
+                )
+            )
+        if f"sol_core{suffix}" in names:
+            sol_cache = {}
 
-        def sol_core(q, k, v, cache=sol_cache):
-            key = (q.data_ptr(), q.shape)
-            if key not in cache:
-                cache.clear()
-                cache[key] = aiter.gfx1201_sage_prepare(q, k, v)
-            return aiter.gfx1201_sol_attention_fwd(
-                *cache[key], q.shape[1], tau, sink_tokens, sink_start
-            )[:, : q.shape[1]]
+            def sol_core(q, k, v, b=backend, cache=sol_cache):
+                key = (q.data_ptr(), q.shape)
+                if key not in cache:
+                    cache.clear()
+                    cache[key] = aiter.gfx1201_sage_prepare(q, k, v)
+                return aiter.gfx1201_sol_attention_fwd(
+                    *cache[key], q.shape[1], tau, sink_tokens, sink_start, b
+                )[:, : q.shape[1]]
 
-        providers["sol_core_hip"] = sol_core
+            providers[f"sol_core{suffix}"] = sol_core
     if "sdpa" in names:
         providers["sdpa"] = lambda q, k, v: F.scaled_dot_product_attention(
             q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
