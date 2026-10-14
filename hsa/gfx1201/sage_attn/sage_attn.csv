@@ -1,2 +1,3 @@
-hdim,knl_name,co_name
-128,_ZN5aiter25sage_fwd_i8f8_hd128_bm512E,sage_fwd_i8f8_hd128_bm512.co
+hdim,list,knl_name,co_name
+128,0,_ZN5aiter25sage_fwd_i8f8_hd128_bm512E,sage_fwd_i8f8_hd128_bm512.co
+128,1,_ZN5aiter30sage_fwd_i8f8_hd128_bm512_listE,sage_fwd_i8f8_hd128_bm512_list.co

@@ -12,7 +12,7 @@ places them at the end of the sequence), or if ``j`` is the last block. Each 512
 blocks' selections exactly; the remaining blocks enter through the Sol-Attn block-summary correction
 (logit ``q . kc_j + log2(len_j)``, value ``vc_j / len_j``) on INT8 pooled keys and FP8 value sums.
 Larger ``tau`` is sparser; with every block selected the result is bitwise equal to the dense
-``gfx1201_sage_attention_fwd(..., backend="hip")``.
+``gfx1201_sage_attention_fwd`` with the same ``backend``.
 """
 
 import torch
@@ -21,7 +21,7 @@ from torch import Tensor
 from csrc.cpp_itfs.torch_utils import direct_register_custom_op
 
 from ..jit.core import compile_ops
-from .gfx1201_sage_attention import _check, gfx1201_sage_attention_fwd_hip
+from .gfx1201_sage_attention import _BACKENDS, _check
 from .gfx1201_sage_prepare import gfx1201_sage_prepare
 
 _KEY_BLOCK = 64
@@ -175,11 +175,18 @@ def gfx1201_sol_attention_fwd(
     tau: float = 1.0,
     sink_tokens: int = 0,
     sink_start: int | None = None,
+    backend: str = "asm",
 ) -> Tensor:
     """Sol attention over the tensors returned by ``gfx1201_sage_prepare``.
 
+    ``backend`` selects the kernel that visits the listed tiles: ``"asm"`` the list variant of the
+    SageAttention code object, ``"hip"`` the HIP kernel (same numerics difference as in
+    ``gfx1201_sage_attention_fwd``; routing and phase A are shared).
+
     Returns BF16 ``[B, S_pad, H, 128]``; rows at or beyond ``seq_len`` are left uninitialized.
     """
+    if backend not in _BACKENDS:
+        raise ValueError(f"backend must be one of {sorted(_BACKENDS)}, got {backend!r}")
     batch, padded, heads, dim = q_int8.shape
     out = torch.empty(
         (batch, padded, heads, dim), device=q_int8.device, dtype=torch.bfloat16
@@ -211,7 +218,7 @@ def gfx1201_sol_attention_fwd(
             state,
             seq_len,
         )
-        gfx1201_sage_attention_fwd_hip(
+        _BACKENDS[backend](
             q8,
             qs,
             k8,
@@ -240,14 +247,16 @@ def gfx1201_sol_attention(
     cosine: Tensor | None = None,
     sine: Tensor | None = None,
     eps: float = 1e-6,
+    backend: str = "asm",
 ) -> Tensor:
     """Non-causal Sol sparse attention for gfx1201 on contiguous BF16 ``[B, S, H, 128]`` Q/K/V.
 
     Lossy: SageAttention quantization plus the Sol-Attn approximation of the unselected key blocks
     (see the module docstring). ``tau``: routing threshold in standard deviations (larger is
     sparser); ``sink_tokens`` / ``sink_start``: key tokens that every query attends to exactly
-    (``sink_start=None``: the last ``sink_tokens``). The norm/RoPE arguments are applied to Q and K first, see
-    ``gfx1201_sage_prepare``.
+    (``sink_start=None``: the last ``sink_tokens``). The norm/RoPE arguments are applied to Q and K
+    first, see ``gfx1201_sage_prepare``. ``backend`` selects the kernel, see
+    ``gfx1201_sol_attention_fwd``.
     """
     _check(query, key, value)
     with torch.cuda.device(query.device):
@@ -263,7 +272,7 @@ def gfx1201_sol_attention(
             eps,
         )
         out = gfx1201_sol_attention_fwd(
-            *prepared, query.shape[1], tau, sink_tokens, sink_start
+            *prepared, query.shape[1], tau, sink_tokens, sink_start, backend
         )
     return out[:, : query.shape[1]].contiguous()
 
@@ -281,6 +290,7 @@ def _gfx1201_sol_attention_fake(
     cosine=None,
     sine=None,
     eps=1e-6,
+    backend="asm",
 ):
     return torch.empty_like(query)
 

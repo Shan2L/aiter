@@ -37,16 +37,21 @@ def prepared(q, k, v):
     return aiter.gfx1201_sage_prepare(q, k, v)
 
 
-def dense_hip(p, rows):
+BACKENDS = ("asm", "hip")
+
+
+def dense(p, rows, backend="asm"):
     import aiter
 
-    return aiter.gfx1201_sage_attention_fwd(*p, rows, backend="hip")
+    return aiter.gfx1201_sage_attention_fwd(*p, rows, backend=backend)
 
 
-def sol(p, rows, tau, sink_tokens=0, sink_start=None):
+def sol(p, rows, tau, sink_tokens=0, sink_start=None, backend="asm"):
     import aiter
 
-    return aiter.gfx1201_sol_attention_fwd(*p, rows, tau, sink_tokens, sink_start)
+    return aiter.gfx1201_sol_attention_fwd(
+        *p, rows, tau, sink_tokens, sink_start, backend
+    )
 
 
 def plan_mask(plan):
@@ -135,18 +140,21 @@ def rel(a, b):
 
 def test_all_exact_matches_dense():
     # Every block exact (sink covering the sequence, or a threshold below every score): the list
-    # core with the neutral Phase-A state must reproduce the dense HIP kernel bitwise.
+    # core with the neutral Phase-A state must reproduce the dense kernel of the same backend
+    # bitwise.
     ok = True
     for rows, heads in ((33, 7), (513, 14), (4097, 28), (20000, 7)):
         p = prepared(*inputs(1, rows, heads))
-        dense = dense_hip(p, rows)[:, :rows]
-        for tau, sink_tokens in ((1.0, rows), (-1.0e30, 0)):
-            same = torch.equal(sol(p, rows, tau, sink_tokens)[:, :rows], dense)
-            ok &= report(
-                f"all exact == dense S{rows} H{heads} tau={tau:g}",
-                {"bitwise": float(same)},
-                same,
-            )
+        for backend in BACKENDS:
+            ref = dense(p, rows, backend)[:, :rows]
+            for tau, sink_tokens in ((1.0, rows), (-1.0e30, 0)):
+                out = sol(p, rows, tau, sink_tokens, backend=backend)[:, :rows]
+                same = torch.equal(out, ref)
+                ok &= report(
+                    f"all exact == dense {backend} S{rows} H{heads} tau={tau:g}",
+                    {"bitwise": float(same)},
+                    same,
+                )
     return ok
 
 
@@ -203,24 +211,24 @@ def test_against_sol_reference():
             dtype=torch.bool,
             device="cuda",
         )
-        dense_err = rel(
-            dense_hip(p, rows)[0, sample],
-            sol_reference(q, k, v, rows, all_exact, sample),
-        )
+        exact_ref = sol_reference(q, k, v, rows, all_exact, sample)
         for tau in (0.0, 1.0, 2.5):
             plan = aiter.gfx1201_sol_route(*p, rows, tau)
             density = plan["tile_count"].sum().item() / (
                 plan["n_wg"] * math.ceil(rows / 32)
             )
             ref = sol_reference(q, k, v, rows, plan_mask(plan), sample)
-            err = rel(sol(p, rows, tau)[0, sample], ref)
-            # Same selection as Sol-Attn: what remains is the quantization error of the dense kernel.
-            stats = {"density": density, "rel_l2": err, "dense_rel_l2": dense_err}
-            ok &= report(
-                f"vs Sol-Attn reference segments={segments} tau={tau}",
-                stats,
-                density < 0.6 and err <= 1.1 * dense_err + 1e-3,
-            )
+            for backend in BACKENDS:
+                dense_err = rel(dense(p, rows, backend)[0, sample], exact_ref)
+                err = rel(sol(p, rows, tau, backend=backend)[0, sample], ref)
+                # Same selection as Sol-Attn: what remains is the quantization error of the
+                # dense kernel.
+                stats = {"density": density, "rel_l2": err, "dense_rel_l2": dense_err}
+                ok &= report(
+                    f"vs Sol-Attn reference {backend} segments={segments} tau={tau}",
+                    stats,
+                    density < 0.6 and err <= 1.1 * dense_err + 1e-3,
+                )
     return ok
 
 
@@ -242,7 +250,7 @@ def test_tau_monotone():
         ],
         1,
     )
-    base = rel(dense_hip(p, rows)[0, sample], exact)
+    base = rel(dense(p, rows)[0, sample], exact)
     densities, errors = [], []
     for tau in (3.0, 1.0, 0.0, -3.0):
         plan = aiter.gfx1201_sol_route(*p, rows, tau, 1024)
@@ -270,12 +278,13 @@ def test_shapes_and_streams():
     op = torch.ops.aiter.gfx1201_sol_attention
     for batch, rows in ((1, 1), (1, 64), (1, 65), (2, 511), (2, 513), (1, 1025)):
         q, k, v = inputs(batch, rows, 3, seed=rows)
-        out = op(q, k, v, 1.0, 0)
-        ok &= report(
-            f"shape B{batch} S{rows}",
-            {},
-            out.shape == q.shape and bool(torch.isfinite(out).all()),
-        )
+        for backend in BACKENDS:
+            out = op(q, k, v, 1.0, 0, backend=backend)
+            ok &= report(
+                f"shape {backend} B{batch} S{rows}",
+                {},
+                out.shape == q.shape and bool(torch.isfinite(out).all()),
+            )
     q, k, v = inputs(2, 3000, 5)
     out = op(q, k, v, 1.0, 256)
     per_batch = torch.cat(
@@ -295,6 +304,33 @@ def test_shapes_and_streams():
     )
     passed = all(r == "SUCCESS" for r in results.values())
     ok &= report("opcheck", {"passed": float(passed)}, passed)
+    return ok
+
+
+def test_asm_vs_hip():
+    # The list code object differs from the HIP list kernel only by the score conversion of
+    # gfx1201_sage_attention_fwd: close with it, bitwise without it (Q/K x8 puts every tile
+    # above the fast-path guard).
+    ok = True
+    for rows, heads in ((33, 7), (4097, 28), (20000, 7)):
+        q, k, v = inputs(1, rows, heads, seed=rows)
+        for scale in (1.0, 8.0):
+            p = prepared(
+                (q.float() * scale).bfloat16(), (k.float() * scale).bfloat16(), v
+            )
+            for tau, sink_tokens in ((1.0, 0), (2.5, rows // 5)):
+                asm = sol(p, rows, tau, sink_tokens, backend="asm")[:, :rows]
+                hip = sol(p, rows, tau, sink_tokens, backend="hip")[:, :rows]
+                again = sol(p, rows, tau, sink_tokens, backend="asm")[:, :rows]
+                err = rel(asm, hip)
+                stats = {"rel_l2": err, "bitwise": float(torch.equal(asm, hip))}
+                good = torch.equal(asm, again) and bool(torch.isfinite(asm).all())
+                good &= torch.equal(asm, hip) if scale == 8.0 else err <= 5e-3
+                ok &= report(
+                    f"asm vs hip S{rows} H{heads} x{scale:g} tau={tau:g} sink={sink_tokens}",
+                    stats,
+                    good,
+                )
     return ok
 
 
@@ -344,6 +380,7 @@ def main():
         test_against_sol_reference,
         test_tau_monotone,
         test_shapes_and_streams,
+        test_asm_vs_hip,
         test_invalid_inputs,
     ):
         ok &= test()
