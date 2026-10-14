@@ -20,6 +20,9 @@ def gfx1201_sage_attention_fwd_hip(
     v_scale: Tensor,
     out: Tensor,
     seq_len: int,
+    tile_list: Tensor | None = None,
+    tile_count: Tensor | None = None,
+    state: Tensor | None = None,
 ) -> None: ...
 
 

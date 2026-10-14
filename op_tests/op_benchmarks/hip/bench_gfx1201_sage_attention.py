@@ -7,7 +7,9 @@ Providers run in interleaved rounds on the same inputs; the reported time is the
 median over rounds of the per-round mean. With --compare_to_ref every provider is
 also checked against an FP32 reference (computed in query chunks). ``sage``/``sage_core``
 use the code object (default backend), ``sage_hip``/``sage_core_hip`` the HIP kernel;
-``*_core`` times the attention kernel alone on prepared inputs.
+``*_core`` times the attention kernel alone on prepared inputs. ``sol_hip``/``sol_core_hip``
+run the Sol sparse attention (routing included) at ``--tau``/``--sink_tokens``/``--sink_start``; random inputs have
+no attention structure, so their routing density (and speed) does not represent a real model.
 """
 
 import argparse
@@ -37,7 +39,7 @@ def parse_shape(text):
     return batch, rows, heads
 
 
-def make_providers(names):
+def make_providers(names, tau=1.0, sink_tokens=0, sink_start=None):
     providers = {}
     for backend, suffix in (("asm", ""), ("hip", "_hip")):
         if f"sage{suffix}" in names:
@@ -59,6 +61,23 @@ def make_providers(names):
                 )[:, : q.shape[1]]
 
             providers[f"sage_core{suffix}"] = core
+    if "sol_hip" in names:
+        providers["sol_hip"] = lambda q, k, v: torch.ops.aiter.gfx1201_sol_attention(
+            q, k, v, tau, sink_tokens, sink_start
+        )
+    if "sol_core_hip" in names:
+        sol_cache = {}
+
+        def sol_core(q, k, v, cache=sol_cache):
+            key = (q.data_ptr(), q.shape)
+            if key not in cache:
+                cache.clear()
+                cache[key] = aiter.gfx1201_sage_prepare(q, k, v)
+            return aiter.gfx1201_sol_attention_fwd(
+                *cache[key], q.shape[1], tau, sink_tokens, sink_start
+            )[:, : q.shape[1]]
+
+        providers["sol_core_hip"] = sol_core
     if "sdpa" in names:
         providers["sdpa"] = lambda q, k, v: F.scaled_dot_product_attention(
             q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
@@ -148,6 +167,21 @@ def main():
             "triton_sage",
         ],
     )
+    parser.add_argument(
+        "--tau", type=float, default=1.0, help="Sol routing threshold (sol_* providers)"
+    )
+    parser.add_argument(
+        "--sink_tokens",
+        type=int,
+        default=0,
+        help="Sol key tokens kept exact for every query (sol_* providers)",
+    )
+    parser.add_argument(
+        "--sink_start",
+        type=int,
+        default=None,
+        help="first sink token (default: the last --sink_tokens tokens)",
+    )
     parser.add_argument("--warmup", type=int, default=2)
     parser.add_argument("--iters", type=int, default=5)
     parser.add_argument("--rounds", type=int, default=3)
@@ -161,7 +195,9 @@ def main():
         print(f"skip: requires gfx1201, got {get_gfx()}")
         return
 
-    providers = make_providers(args.providers)
+    providers = make_providers(
+        args.providers, args.tau, args.sink_tokens, args.sink_start
+    )
     rows = []
     for shape in args.shapes:
         batch, seq, heads = parse_shape(shape)
