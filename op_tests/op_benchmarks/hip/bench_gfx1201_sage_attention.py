@@ -5,7 +5,9 @@
 
 Providers run in interleaved rounds on the same inputs; the reported time is the
 median over rounds of the per-round mean. With --compare_to_ref every provider is
-also checked against an FP32 reference (computed in query chunks).
+also checked against an FP32 reference (computed in query chunks). ``sage``/``sage_core``
+use the code object (default backend), ``sage_hip``/``sage_core_hip`` the HIP kernel;
+``*_core`` times the attention kernel alone on prepared inputs.
 """
 
 import argparse
@@ -37,23 +39,26 @@ def parse_shape(text):
 
 def make_providers(names):
     providers = {}
-    if "sage" in names:
-        providers["sage"] = lambda q, k, v: torch.ops.aiter.gfx1201_sage_attention(
-            q, k, v
-        )
-    if "sage_core" in names:
-        cache = {}
+    for backend, suffix in (("asm", ""), ("hip", "_hip")):
+        if f"sage{suffix}" in names:
+            providers[f"sage{suffix}"] = (
+                lambda q, k, v, b=backend: torch.ops.aiter.gfx1201_sage_attention(
+                    q, k, v, backend=b
+                )
+            )
+        if f"sage_core{suffix}" in names:
+            cache = {}
 
-        def core(q, k, v):
-            key = (q.data_ptr(), q.shape)
-            if key not in cache:
-                cache.clear()
-                cache[key] = aiter.gfx1201_sage_prepare(q, k, v)
-            return aiter.gfx1201_sage_attention_fwd(*cache[key], q.shape[1])[
-                :, : q.shape[1]
-            ]
+            def core(q, k, v, b=backend, cache=cache):
+                key = (q.data_ptr(), q.shape)
+                if key not in cache:
+                    cache.clear()
+                    cache[key] = aiter.gfx1201_sage_prepare(q, k, v)
+                return aiter.gfx1201_sage_attention_fwd(
+                    *cache[key], q.shape[1], backend=b
+                )[:, : q.shape[1]]
 
-        providers["sage_core"] = core
+            providers[f"sage_core{suffix}"] = core
     if "sdpa" in names:
         providers["sdpa"] = lambda q, k, v: F.scaled_dot_product_attention(
             q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
@@ -132,7 +137,16 @@ def main():
         "--shapes", nargs="+", default=DEFAULT_SHAPES, help="B,S,H (head dim is 128)"
     )
     parser.add_argument(
-        "--providers", nargs="+", default=["sage", "sage_core", "sdpa", "triton_sage"]
+        "--providers",
+        nargs="+",
+        default=[
+            "sage",
+            "sage_core",
+            "sage_hip",
+            "sage_core_hip",
+            "sdpa",
+            "triton_sage",
+        ],
     )
     parser.add_argument("--warmup", type=int, default=2)
     parser.add_argument("--iters", type=int, default=5)

@@ -23,6 +23,29 @@ def gfx1201_sage_attention_fwd_hip(
 ) -> None: ...
 
 
+@compile_ops(
+    "module_gfx1201_sage_attention_asm",
+    fc_name="gfx1201_sage_attention_fwd_asm",
+    ffi_type="ctypes",
+)
+def gfx1201_sage_attention_fwd_asm(
+    q_int8: Tensor,
+    q_scale: Tensor,
+    k_int8: Tensor,
+    k_scale: Tensor,
+    v_fp8: Tensor,
+    v_scale: Tensor,
+    out: Tensor,
+    seq_len: int,
+) -> None: ...
+
+
+_BACKENDS = {
+    "asm": gfx1201_sage_attention_fwd_asm,
+    "hip": gfx1201_sage_attention_fwd_hip,
+}
+
+
 def gfx1201_sage_attention_fwd(
     q_int8: Tensor,
     q_scale: Tensor,
@@ -31,21 +54,29 @@ def gfx1201_sage_attention_fwd(
     v_fp8: Tensor,
     v_scale: Tensor,
     seq_len: int,
+    backend: str = "asm",
 ) -> Tensor:
     """Attention over the tensors returned by ``gfx1201_sage_prepare``.
 
     Returns BF16 ``[B, S_pad, H, 128]``; rows at or beyond ``seq_len`` are left
     uninitialized.
+
+    ``backend="asm"`` runs the hand-scheduled code object, ``"hip"`` the HIP kernel.
+    They differ only in how the INT8 Q K^T scores reach the softmax: on (32 query rows,
+    32 key rows) tiles with ``q_scale * k_scale <= 1/384`` the code object reads the int32
+    scores through a 1.5 * 2^23 bias and folds scale and row maximum into one FMA, which
+    adds one rounding of at most 2^-9 in log2 of P. Other tiles use the exact conversion;
+    if no tile qualifies, the output is bitwise equal to the HIP kernel.
     """
+    if backend not in _BACKENDS:
+        raise ValueError(f"backend must be one of {sorted(_BACKENDS)}, got {backend!r}")
     batch, padded, heads, dim = q_int8.shape
     if not 0 < seq_len <= padded or padded % 32:
         raise ValueError(f"seq_len {seq_len} does not fit padded length {padded}")
     out = torch.empty(
         (batch, padded, heads, dim), device=q_int8.device, dtype=torch.bfloat16
     )
-    gfx1201_sage_attention_fwd_hip(
-        q_int8, q_scale, k_int8, k_scale, v_fp8, v_scale, out, seq_len
-    )
+    _BACKENDS[backend](q_int8, q_scale, k_int8, k_scale, v_fp8, v_scale, out, seq_len)
     return out
 
 
@@ -69,13 +100,15 @@ def gfx1201_sage_attention(
     cosine: Tensor | None = None,
     sine: Tensor | None = None,
     eps: float = 1e-6,
+    backend: str = "asm",
 ) -> Tensor:
     """Non-causal SageAttention for gfx1201: INT8 QK^T, FP8 PV, FP32 accumulation.
 
     ``query``/``key``/``value``: contiguous BF16 ``[B, S, H, 128]``; returns the same
     shape. Lossy by design (Q/K quantized per 32-row block, V per channel).
     The optional norm/RoPE arguments are applied to Q and K first, see
-    ``gfx1201_sage_prepare``.
+    ``gfx1201_sage_prepare``. ``backend`` selects the attention kernel, see
+    ``gfx1201_sage_attention_fwd``.
     """
     _check(query, key, value)
     with torch.cuda.device(query.device):
@@ -90,7 +123,7 @@ def gfx1201_sage_attention(
             sine,
             eps,
         )
-        out = gfx1201_sage_attention_fwd(*prepared, query.shape[1])
+        out = gfx1201_sage_attention_fwd(*prepared, query.shape[1], backend)
     return out[:, : query.shape[1]].contiguous()
 
 
@@ -104,6 +137,7 @@ def _gfx1201_sage_attention_fake(
     cosine=None,
     sine=None,
     eps=1e-6,
+    backend="asm",
 ):
     return torch.empty_like(query)
 
